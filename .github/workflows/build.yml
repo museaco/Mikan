@@ -1,0 +1,148 @@
+name: Build Mikan Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Windows EXE
+            os: windows-latest
+            build-args: --no-bundle
+            artifact-suffix: windows-portable-exe
+            artifact-extension: exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri bundle
+        run: pnpm exec tauri build ${{ matrix.platform.build-args }}
+
+      - name: Prepare release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-out
+
+          if ("${{ runner.os }}" -eq "Windows") {
+            Copy-Item `
+              -Path "src-tauri/target/release/mikan.exe" `
+              -Destination "release-out/Mikan-${{ github.ref_name }}-windows-x64.exe"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mikan-${{ github.ref_name }}-${{ matrix.platform.artifact-suffix }}
+          path: release-out/*.${{ matrix.platform.artifact-extension }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Show release files
+        run: find release-assets -type f
+
+      - name: Build release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $lines = Get-Content -Path CHANGELOG.md
+          $headingPattern = '^\s*##\s+\[?' + [regex]::Escape($tag) + '\]?(?:\s+[-(].*)?\s*$'
+          $start = -1
+
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match $headingPattern) {
+              $start = $i
+              break
+            }
+          }
+
+          if ($start -lt 0) {
+            throw "CHANGELOG.md does not contain a '## $tag' section."
+          }
+
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*##\s+') {
+              $end = $i
+              break
+            }
+          }
+
+          if ($end -le ($start + 1)) {
+            throw "CHANGELOG.md section '## $tag' is empty."
+          }
+
+          $section = ($lines[($start + 1)..($end - 1)] -join "`n").Trim()
+          if ([string]::IsNullOrWhiteSpace($section)) {
+            throw "CHANGELOG.md section '## $tag' is empty."
+          }
+
+          $body = @(
+            $section,
+            '',
+            '## Downloads',
+            '- Windows: download the portable `.exe` and double-click it. No installer is required.',
+            '',
+            '## Notes',
+            '- The Windows portable `.exe` may require Microsoft Edge WebView2 Runtime on older Windows systems.'
+          )
+
+          Set-Content -Path release-notes.md -Value $body -Encoding utf8
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Mikan ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            release-assets/**/*.exe
+          fail_on_unmatched_files: true
+          make_latest: true
+          overwrite_files: true
